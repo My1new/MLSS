@@ -1,5 +1,5 @@
 
-# DLCMH(Double label guided cross modal hashing of image and text)
+# (SMLS)
 DATA
 ===================
 MIRFLICKR25K:
