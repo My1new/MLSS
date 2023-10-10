@@ -1,0 +1,203 @@
+import copy
+import os
+import torch
+import logging
+import torch.nn as nn
+import numpy as np
+from typing import Union
+# from torch.nn import Modulelist
+from model.model import build_model
+# from model.gcn_model import MYGCN
+from utils import get_logger, get_summary_writer
+from scipy.io import loadmat
+from torch.nn import Parameter
+import math
+import torch.nn.functional as F
+
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.kaiming_uniform_(m.weight, mode='fan_out')
+        nn.init.constant_(m.bias, 0.0)
+    elif classname.find('Conv') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif classname.find('BatchNorm') != -1:
+        if m.affine:
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+
+
+class HashLayer(nn.Module):
+    LINEAR_EMBED = 128
+    SIGMOID_ALPH = 10
+
+    def __init__(self, inputDim=2048, outputDim=64):
+        super(HashLayer, self).__init__()
+        self.fc = nn.Linear(inputDim, self.LINEAR_EMBED)
+        self.fc.apply(weights_init_kaiming)
+
+        self.hash_list = nn.ModuleList([nn.Linear(self.LINEAR_EMBED, 2) for _ in range(outputDim)])
+        for item in self.hash_list:
+            item.apply(weights_init_kaiming)
+
+    def forward(self, data):
+        embed = self.fc(data)
+        embed = torch.relu(embed)
+        softmax_list = [torch.softmax(item(embed), dim=-1) for item in self.hash_list]
+
+        return softmax_list
+
+
+class SMLS(nn.Module):
+
+    def __init__(self,
+                 clipPath="./ViT-B-32.pt",
+                 writer=None,
+                 saveDir="./result/log",
+                 logger: logging.Logger = None,
+                 is_train=True,
+                 linear=False):
+        super(SMLS, self).__init__()
+        os.makedirs(saveDir, exist_ok=True)
+        self.logger = logger if logger is not None else get_logger(
+            os.path.join(saveDir, "train.log" if is_train else "test.log"))
+        self.writer = writer if writer is not None and is_train else get_summary_writer(
+            os.path.join(saveDir, "tensorboard"))
+
+
+        embedDim, self.clip = self.load_clip(clipPath)
+        self.local = LocalFeature(input_channels=3,outdim=512,l1 =1e-4)
+
+        self.inp = loadmat('embedding/' + 'mirflickr' + 'googlenews.mat')['inp']
+        self.inp = torch.FloatTensor(self.inp)
+        self.gcn =MYGCN(num_classes=24, t=0.6, adj_file='data/' + 'flick/' + '/adj.mat',
+                     inp=self.inp, gamma=0.4,)
+
+    def freezen(self):
+        for name, param in self.clip.named_parameters():
+            # print(name)
+            if name.find("ln_final.") == 0 or name.find("text_projection") == 0 or name.find("logit_scale") == 0 \
+                    or name.find("visual.ln_post.") == 0 or name.find("visual.proj") == 0:
+                # print("1")
+                continue
+            elif name.find("visual.transformer.resblocks.") == 0 or name.find("transformer.resblocks.") == 0:
+                layer_num = int(name.split(".resblocks.")[1].split(".")[0])
+                if layer_num >= 12:
+                    # print("2")
+                    continue
+            if name.find("conv2.") == 0:
+                # print("3")
+                continue
+            else:
+                # paramenters which < freeze_layer_num will be freezed
+                param.requires_grad = False
+
+    def load_clip(self, clipPath: str) -> tuple:
+        try:
+            model = torch.jit.load(clipPath, map_location="cpu").eval()
+            state_dict = model.state_dict()
+        except RuntimeError:
+            state_dict = torch.load(clipPath, map_location="cpu")
+
+        return state_dict["text_projection"].shape[1], build_model(state_dict)
+
+
+    def eval(self):
+        self.gcn.eval()
+
+
+    def train(self):
+        self.gcn.train()
+
+
+    def encode_image_text(self,image,text):
+        image_embed = self.clip.encode_image(image)
+        text_embed = self.clip.encode_text(text)
+        image_embed,l1_reg = self.local(image,image_embed)
+        y_img, y_text, x,image_embed ,text_embed=self.gcn(image_embed,text_embed)
+        return image_embed,text_embed,y_img, y_text, x, l1_reg
+
+    def forward(self, image, text):
+        return self.encode_image_text(image,text)
+
+class LocalFeature(nn.Module):
+    def __init__(self,input_channels,outdim,l1 =1e-4):
+        super(LocalFeature,self).__init__()
+        self.conv1 =nn.Conv2d(input_channels,64,kernel_size =3,stride =1,padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 =nn.Conv2d(64,128,kernel_size =3,stride=1,padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.relu = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(kernel_size=2,stride=2)
+        self.pool2 = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(128,outdim)
+        self.l1 =l1
+        self.fusion = nn.Linear(outdim+outdim,outdim)
+    def forward(self,x,y):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool1(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        l1_reg = self.l1 *torch.sum(torch.abs(self.fc.weight))
+        x = torch.cat([0.1*x,0.9*y],dim=1)
+        x = self.fusion(x)
+        return x,l1_reg
+
+
+class MYGCN(nn.Module):
+    def __init__(self, minus_one_dim=512, num_classes=21, in_channel=300, t=0,
+                 adj_file=None, inp=None, gamma=0,input_Dim=512,output_Dim=64):
+        super(MYGCN, self).__init__()
+
+        self.num_classes = num_classes
+        self.gamma = gamma
+
+        self.gc1 = GCN(in_channel, minus_one_dim)
+        self.gc2 = GCN(minus_one_dim, minus_one_dim)
+        self.gc3 = GCN(minus_one_dim, minus_one_dim)
+        self.relu = nn.LeakyReLU(0.2)
+        self.hypo = nn.Linear(3 * minus_one_dim, minus_one_dim)
+        self.hash = HashLayer(inputDim=input_Dim,outputDim=output_Dim)
+
+        _adj = gen_A(num_classes, t, adj_file)
+        self.A = Parameter(torch.FloatTensor(_adj), requires_grad=False)
+        self.B = Parameter(0.02 * torch.rand(num_classes, num_classes))
+        if inp is not None:
+            self.inp = Parameter(inp, requires_grad=False)
+        else:
+            self.inp = Parameter(torch.rand(num_classes, in_channel))
+        self.image_normalization_mean = [0.485, 0.456, 0.406]
+        self.image_normalization_std = [0.229, 0.224, 0.225]
+
+    def get_adj_super(self):
+        super_adj = self.A
+        return super_adj
+
+    def forward(self, feature_img, feature_text):
+        adj = gen_adj(self.A + self.gamma * self.B)
+        layers = []
+        x= self.gc1(self.inp, adj)
+        x = self.relu(x)
+        layers.append(x)
+        x= self.gc2(x, adj)
+        x = self.relu(x)
+        layers.append(x)
+        x= self.gc3(x, adj)
+        x = self.relu(x)
+        layers.append(x)
+        x = torch.cat(layers, -1)
+        x = self.hypo(x)
+        norm_img = torch.norm(feature_img, dim=1)[:, None] * torch.norm(x, dim=1)[None, :] + 1e-6
+        norm_txt = torch.norm(feature_text, dim=1)[:, None] * torch.norm(x, dim=1)[None, :] + 1e-6
+        x = x.transpose(0, 1)
+        y_img = torch.matmul(feature_img, x)
+        y_text = torch.matmul(feature_text, x)
+        y_img = y_img / norm_img
+        y_text = y_text / norm_txt
+        hash_img,hash_text =self.hash(feature_img),self.hash(feature_text)
+        return y_img, y_text, x,hash_img,hash_text
