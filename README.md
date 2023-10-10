@@ -1,4 +1,3 @@
-#Sharing Multi-label Semantic Image-Text Matching via Multimodal Transformers(SMLS)
 DATA
 ===================
 MIRFLICKR25K:
